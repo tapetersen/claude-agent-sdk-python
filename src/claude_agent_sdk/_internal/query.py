@@ -852,8 +852,8 @@ class Query:
 
     async def receive_messages(self) -> AsyncGenerator[dict[str, Any], None]:
         """Receive SDK messages (not control messages)."""
-        with self._message_receive:
-            async for message in self._message_receive:
+        with self._message_receive.clone() as stream:
+            async for message in stream:
                 if message.get("type") == "end":
                     break
                 elif message.get("type") == "error":
@@ -871,14 +871,13 @@ class Query:
         await self.transport.close()
         if self._stg is not None:
             await self._stg.aclose()
-        # The read task's finally closed the send side; repeat here for the
-        # case where start() was never called. Do NOT close the receive
-        # side — it belongs to the consumer, and anyio's receive_nowait()
-        # checks _closed before the buffer, so closing it here would make a
-        # non-parked consumer drop buffered messages with
-        # ClosedResourceError. _message_send.close() alone yields
-        # EndOfStream after the buffer drains.
+        # Close both sides. The read task's finally closes the send side, but
+        # we repeat here for the case where start() was never called.
+        # receive_messages() always uses a clone so closing the original here
+        # is safe — active consumers are unaffected and buffered messages still
+        # drain normally through their clone handle.
         self._message_send.close()
+        self._message_receive.close()
 
     # Make Query an async iterator
     def __aiter__(self) -> AsyncGenerator[dict[str, Any], None]:

@@ -345,12 +345,11 @@ class TestClaudeSDKClientTrioBackend:
 
 
 class TestClaudeSDKClientResourceCleanup:
-    """Regression for #859: _message_receive must be closed after iteration.
+    """Regression for #859: _message_receive must be closed after use.
 
-    ``Query.close()`` deliberately leaves ``_message_receive`` open so a
-    concurrently-draining consumer can finish. The ``receive_messages()``
-    generator owns the receive side and closes it via a ``with`` block when
-    the generator exits for any reason — natural end, break, or aclose().
+    ``Query.close()`` closes both ``_message_send`` and ``_message_receive``.
+    ``receive_messages()`` iterates a clone so active consumers are unaffected.
+    Both sides are always released regardless of whether the consumer iterates.
     """
 
     def test_receive_messages_generator_closes_receive_stream(self):
@@ -371,6 +370,8 @@ class TestClaudeSDKClientResourceCleanup:
 
             async for _ in q.receive_messages():
                 pass
+
+            await q.close()
 
         anyio.run(_test)
 

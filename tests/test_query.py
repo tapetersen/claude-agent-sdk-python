@@ -669,9 +669,6 @@ class TestQueryCrossTaskCleanup:
         anyio.run(_test)
 
 
-@pytest.mark.filterwarnings(
-    "ignore:Unclosed <MemoryObjectReceiveStream:ResourceWarning"
-)
 class TestQueryTrioBackend:
     """Regression tests for trio compatibility.
 
@@ -680,10 +677,6 @@ class TestQueryTrioBackend:
     implementation of that (``loop.create_task()``) raises ``RuntimeError``
     under trio; these tests run start/spawn_task/close on the trio backend
     to guard the sniffio-dispatch path.
-
-    The ResourceWarning filter is for ``_message_receive``: tests that don't
-    iterate ``receive_messages()`` leave it unclosed; trio's GC timing
-    surfaces anyio's ``__del__`` warning.
     """
 
     def test_start_and_close_under_trio(self):
@@ -881,11 +874,9 @@ class TestQueryTrioBackend:
     def test_buffered_messages_drain_after_close_asyncio(self):
         """Consumer in user code when close() runs must drain the buffer.
 
-        anyio's ``receive_nowait()`` checks ``_closed`` before the buffer,
-        so closing ``_message_receive`` from ``close()`` would make a
-        non-parked consumer hit ``ClosedResourceError`` and drop buffered
-        messages. ``_message_send.close()`` alone yields ``EndOfStream``
-        only after the buffer drains.
+        ``receive_messages()`` iterates a clone of ``_message_receive``, so
+        ``close()`` closing the original does not affect an active consumer.
+        Buffered messages continue to drain through the consumer's clone handle.
         """
         self._run_buffered_drain_after_close("asyncio")
 
