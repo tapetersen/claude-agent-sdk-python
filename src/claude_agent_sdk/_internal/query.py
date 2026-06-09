@@ -254,7 +254,10 @@ class Query:
         try:
             async for message in self.transport.read_messages():
                 if self._closed:
-                    break
+                    # Keep reading to drain stdout while transport.close() waits
+                    # for the subprocess to exit. If we break here, nobody reads
+                    # the pipe, it fills up, and the subprocess blocks in write().
+                    continue
 
                 msg_type = message.get("type")
 
