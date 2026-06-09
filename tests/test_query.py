@@ -681,10 +681,9 @@ class TestQueryTrioBackend:
     under trio; these tests run start/spawn_task/close on the trio backend
     to guard the sniffio-dispatch path.
 
-    The ResourceWarning filter is for ``_message_receive``: ``Query`` owns
-    the send side (and closes it), but the receive side is the consumer's
-    to close. Tests that don't iterate ``receive_messages()`` leave it
-    unclosed; trio's GC timing surfaces anyio's ``__del__`` warning.
+    The ResourceWarning filter is for ``_message_receive``: tests that don't
+    iterate ``receive_messages()`` leave it unclosed; trio's GC timing
+    surfaces anyio's ``__del__`` warning.
     """
 
     def test_start_and_close_under_trio(self):

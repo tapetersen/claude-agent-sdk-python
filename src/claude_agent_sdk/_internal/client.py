@@ -196,6 +196,7 @@ class InternalClient:
                 )
             )
 
+        _recv = query.receive_messages()
         try:
             # Start reading messages
             await query.start()
@@ -222,11 +223,11 @@ class InternalClient:
                 query._stg.tg.start_soon(query.stream_input, prompt)
 
             # Yield parsed messages, skipping unknown message types
-            async for data in query.receive_messages():
+            async for data in _recv:
                 message = parse_message(data)
                 if message is not None:
                     yield message
 
         finally:
+            await _recv.aclose()
             await query.close()
-            query.close_receive_stream()

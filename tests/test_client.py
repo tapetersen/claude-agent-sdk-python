@@ -1,10 +1,10 @@
 """Tests for Claude SDK client functionality."""
 
+import gc
 import os
 from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
-import pytest
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -160,7 +160,6 @@ class TestQueryFunction:
                 mock_query.start = AsyncMock()
                 mock_query.initialize = AsyncMock()
                 mock_query.close = AsyncMock()
-                mock_query.close_receive_stream = Mock()
                 mock_query._tg = None
 
                 def _consume_coro(coro):
@@ -346,21 +345,15 @@ class TestClaudeSDKClientTrioBackend:
 
 
 class TestClaudeSDKClientResourceCleanup:
-    """Regression for #859: disconnect() must close the receive stream.
+    """Regression for #859: _message_receive must be closed after iteration.
 
     ``Query.close()`` deliberately leaves ``_message_receive`` open so a
-    concurrently-draining consumer can finish (see
-    ``test_buffered_messages_drain_after_close_*``). The owning consumer
-    is responsible for closing it once done; ``disconnect()`` is that
-    consumer for ``ClaudeSDKClient``. Before the fix, ``__aexit__`` left
-    the stream open and anyio's ``__del__`` emitted ``ResourceWarning:
-    Unclosed <MemoryObjectReceiveStream>`` under PYTHONDEVMODE.
+    concurrently-draining consumer can finish. The ``receive_messages()``
+    generator owns the receive side and closes it via a ``with`` block when
+    the generator exits for any reason — natural end, break, or aclose().
     """
 
-    def test_disconnect_closes_receive_stream(self):
-        from anyio import ClosedResourceError
-
-        from claude_agent_sdk import ClaudeSDKClient
+    def test_receive_messages_generator_closes_receive_stream(self):
         from claude_agent_sdk._internal.query import Query
 
         async def _test():
@@ -373,13 +366,12 @@ class TestClaudeSDKClientResourceCleanup:
 
             mock_transport.read_messages = read_messages
 
-            client = ClaudeSDKClient(transport=mock_transport)
-            client._transport = mock_transport
-            client._query = Query(transport=mock_transport, is_streaming_mode=True)
-            await client._query.start()
-            receive_stream = client._query._message_receive
-            await client.disconnect()
-            with pytest.raises(ClosedResourceError):
-                receive_stream.receive_nowait()
+            q = Query(transport=mock_transport, is_streaming_mode=True)
+            await q.start()
+
+            async for _ in q.receive_messages():
+                pass
 
         anyio.run(_test)
+
+        gc.collect()
