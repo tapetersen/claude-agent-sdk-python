@@ -496,31 +496,8 @@ class TestCloseAfterEarlyBreak:
     """Regression test for issue #378: close() hangs when called after breaking
     out of receive_messages() before the transport has finished."""
 
-    def _blocking_query(self) -> "Query":
-        """Return a started Query backed by a transport that blocks forever after one message."""
-
-        async def blocking_read_messages():
-            yield {
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "Hello"}],
-                    "model": "claude-sonnet-4-20250514",
-                },
-            }
-            await anyio.sleep_forever()
-
-        mock_transport = AsyncMock()
-        mock_transport.read_messages = blocking_read_messages
-        mock_transport.close = AsyncMock()
-        mock_transport.connect = AsyncMock()
-        mock_transport.is_ready = Mock(return_value=True)
-        return Query(transport=mock_transport, is_streaming_mode=False)
-
-    def test_subprocess_transport_close_after_early_break(self, tmp_path: Path):
-        """Breaking out of receive_messages() backed by a real SubprocessCLITransport
-        should complete cleanly — exercises process shutdown, not just mock cancellation."""
-        import os
+    def _make_blocking_subprocess_transport(self, tmp_path: Path):
+        """Return a SubprocessCLITransport backed by a fake CLI that emits one message then blocks on stdin."""
         import stat
         import textwrap
 
@@ -540,12 +517,18 @@ class TestCloseAfterEarlyBreak:
         """)
         )
         script_path.chmod(stat.S_IRWXU)
+        return SubprocessCLITransport(
+            prompt="test",
+            options=ClaudeAgentOptions(cli_path=script_path),
+        )
+
+    def test_subprocess_transport_close_after_early_break(self, tmp_path: Path):
+        """Breaking out of receive_messages() backed by a real SubprocessCLITransport
+        should complete cleanly — exercises process shutdown, not just mock cancellation."""
+        import os
 
         async def _test():
-            transport = SubprocessCLITransport(
-                prompt="test",
-                options=ClaudeAgentOptions(cli_path=script_path),
-            )
+            transport = self._make_blocking_subprocess_transport(tmp_path)
             await transport.connect()
 
             q = Query(transport=transport, is_streaming_mode=False)
@@ -560,22 +543,27 @@ class TestCloseAfterEarlyBreak:
         with patch.dict(os.environ, {"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": "1"}):
             anyio.run(_test)
 
-    def test_loop_end_cleans_up_without_explicit_close(self):
-        """Abandoning a query without calling close() should not cause the event
-        loop to hang during cleanup — the service task must respond to cancellation."""
+    def test_loop_end_cleans_up_without_explicit_close(self, tmp_path: Path):
+        """Abandoning a query backed by a real SubprocessCLITransport without calling
+        close() should not hang — the service task must respond to cancellation."""
+        import os
         import threading
 
         async def _test():
-            q = self._blocking_query()
+            transport = self._make_blocking_subprocess_transport(tmp_path)
+            await transport.connect()
+
+            q = Query(transport=transport, is_streaming_mode=False)
             await q.start()
 
-            async for _msg in q.receive_messages():
+            async for _ in q.receive_messages():
                 break  # never call q.close()
 
-        thread = threading.Thread(target=lambda: anyio.run(_test), daemon=True)
-        thread.start()
-        thread.join(timeout=2.0)
-        assert not thread.is_alive(), "event loop hung cleaning up abandoned query"
+        with patch.dict(os.environ, {"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": "1"}):
+            thread = threading.Thread(target=lambda: anyio.run(_test), daemon=True)
+            thread.start()
+            thread.join(timeout=5.0)
+            assert not thread.is_alive(), "event loop hung cleaning up abandoned query"
 
 
 class TestNoTimeoutForHooksAndMcpServers:
