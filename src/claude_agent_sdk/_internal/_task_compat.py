@@ -23,6 +23,8 @@ from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from typing import Any
 
+import anyio
+import anyio.abc
 import sniffio
 
 logger = logging.getLogger(__name__)
@@ -174,3 +176,68 @@ def spawn_detached(coro: Coroutine[Any, Any, Any]) -> TaskHandle:
         f"Unsupported async backend: {backend!r}. "
         "claude_agent_sdk requires asyncio or trio."
     )
+
+
+class _ServiceTaskGroup:
+    """Task group hosted in a detached background service task.
+
+    Hosts an anyio TaskGroup in a background task so that
+    ``cancel_scope.cancel()`` is safe from any calling task — no
+    cancel-scope task affinity. Used by ``Query`` to manage the reader
+    task and per-request control handlers.
+    """
+
+    def __init__(self) -> None:
+        self.tg: anyio.abc.TaskGroup | None = None
+
+    async def _host(self) -> None:
+        try:
+            async with anyio.create_task_group() as tg:
+                self.tg = tg
+                self._ready.set()
+                await anyio.sleep_forever()
+        except Exception as e:
+            logger.warning("_ServiceTaskGroup host raised unexpectedly", exc_info=e)
+        finally:
+            self._done.set()
+
+    async def start(self) -> None:
+        """Start the background host task and wait until the TaskGroup is ready."""
+        self._ready: anyio.Event = anyio.Event()
+        self._done: anyio.Event = anyio.Event()
+        backend = sniffio.current_async_library()
+        if backend == "asyncio":
+            import asyncio
+
+            asyncio.get_running_loop().create_task(self._host())
+        elif backend == "trio":
+            import trio
+
+            async def _safe_host() -> None:
+                try:
+                    await self._host()
+                except BaseException as exc:  # noqa: BLE001
+                    # System tasks must not propagate; _host() logs unexpected errors.
+                    if not isinstance(exc, trio.Cancelled):
+                        logger.warning(
+                            "_ServiceTaskGroup host: BaseException leaked", exc_info=exc
+                        )
+
+            trio.lowlevel.spawn_system_task(
+                _safe_host, context=contextvars.copy_context()
+            )
+        else:
+            raise RuntimeError(
+                f"Unsupported async backend: {backend!r}. "
+                "claude_agent_sdk requires asyncio or trio."
+            )
+        await self._ready.wait()
+
+    async def aclose(self) -> None:
+        """Cancel all hosted tasks and wait for the host to finish."""
+        if self.tg is not None:
+            self.tg.cancel_scope.cancel()
+        # Shield so cleanup completes even if called from a cancelled scope
+        # (e.g. async-generator finalizer, fail_after expiry).
+        with anyio.CancelScope(shield=True):
+            await self._done.wait()

@@ -27,7 +27,7 @@ from ..types import (
     SDKHookCallbackRequest,
     ToolPermissionContext,
 )
-from ._task_compat import TaskHandle, spawn_detached
+from ._task_compat import _ServiceTaskGroup
 from .transport import Transport
 
 if TYPE_CHECKING:
@@ -121,9 +121,8 @@ class Query:
         self._message_send, self._message_receive = anyio.create_memory_object_stream[
             dict[str, Any]
         ](max_buffer_size=100)
-        self._read_task: TaskHandle | None = None
-        self._child_tasks: set[TaskHandle] = set()
-        self._inflight_requests: dict[str, TaskHandle] = {}
+        self._stg: _ServiceTaskGroup | None = None
+        self._inflight_requests: dict[str, anyio.CancelScope] = {}
         self._initialized = False
         self._closed = False
         self._initialization_result: dict[str, Any] | None = None
@@ -223,26 +222,27 @@ class Query:
 
     async def start(self) -> None:
         """Start reading messages from transport."""
-        if self._read_task is None:
-            self._read_task = spawn_detached(self._read_messages())
-
-    def spawn_task(self, coro: Any) -> TaskHandle:
-        """Spawn a child task that will be cancelled on close()."""
-        task = spawn_detached(coro)
-        self._child_tasks.add(task)
-        task.add_done_callback(self._child_tasks.discard)
-        return task
+        if self._stg is None:
+            self._stg = _ServiceTaskGroup()
+            await self._stg.start()
+            assert self._stg.tg is not None
+            self._stg.tg.start_soon(self._read_messages)
 
     def _spawn_control_request_handler(self, request: SDKControlRequest) -> None:
-        """Spawn a control request handler and track it for cancellation."""
+        """Spawn a control request handler with an individual cancel scope."""
         req_id = request["request_id"]
-        task = self.spawn_task(self._handle_control_request(request))
-        self._inflight_requests[req_id] = task
+        cancel_scope = anyio.CancelScope()
+        self._inflight_requests[req_id] = cancel_scope
 
-        def _done(_t: TaskHandle) -> None:
-            self._inflight_requests.pop(req_id, None)
+        async def _handler() -> None:
+            try:
+                with cancel_scope:
+                    await self._handle_control_request(request)
+            finally:
+                self._inflight_requests.pop(req_id, None)
 
-        task.add_done_callback(_done)
+        assert self._stg is not None and self._stg.tg is not None
+        self._stg.tg.start_soon(_handler)
 
     async def _read_messages(self) -> None:
         """Read messages from transport and route them."""
@@ -824,7 +824,10 @@ class Query:
             )
             await self._first_result_event.wait()
 
-        await self.transport.end_input()
+        try:
+            await self.transport.end_input()
+        except Exception as e:
+            logger.debug("end_input() failed (transport likely already closed): %s", e)
 
     async def stream_input(self, stream: AsyncIterable[dict[str, Any]]) -> None:
         """Stream input messages to transport.
@@ -860,12 +863,9 @@ class Query:
         # don't drop the current turn when the process exits immediately.
         if self._transcript_mirror_batcher is not None:
             await self._transcript_mirror_batcher.close()
-        for task in list(self._child_tasks):
-            task.cancel()
-        if self._read_task is not None and not self._read_task.done():
-            self._read_task.cancel()
-            await self._read_task.wait()
-        self._read_task = None
+        await self.transport.close()
+        if self._stg is not None:
+            await self._stg.aclose()
         # The read task's finally closed the send side; repeat here for the
         # case where start() was never called. Do NOT close the receive
         # side — it belongs to the consumer, and anyio's receive_nowait()
@@ -875,7 +875,6 @@ class Query:
         # EndOfStream after the buffer drains; the consumer calls
         # close_receive_stream() once it's done iterating (#859).
         self._message_send.close()
-        await self.transport.close()
 
     def close_receive_stream(self) -> None:
         """Close the receive side of the message stream.

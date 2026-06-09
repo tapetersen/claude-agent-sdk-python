@@ -9,6 +9,7 @@ first result arrives.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
@@ -491,6 +492,92 @@ class TestAsyncIterablePromptWithSdkMcpServers:
         anyio.run(_test)
 
 
+class TestCloseAfterEarlyBreak:
+    """Regression test for issue #378: close() hangs when called after breaking
+    out of receive_messages() before the transport has finished."""
+
+    def _blocking_query(self) -> "Query":
+        """Return a started Query backed by a transport that blocks forever after one message."""
+
+        async def blocking_read_messages():
+            yield {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello"}],
+                    "model": "claude-sonnet-4-20250514",
+                },
+            }
+            await anyio.sleep_forever()
+
+        mock_transport = AsyncMock()
+        mock_transport.read_messages = blocking_read_messages
+        mock_transport.close = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.is_ready = Mock(return_value=True)
+        return Query(transport=mock_transport, is_streaming_mode=False)
+
+    def test_subprocess_transport_close_after_early_break(self, tmp_path: Path):
+        """Breaking out of receive_messages() backed by a real SubprocessCLITransport
+        should complete cleanly — exercises process shutdown, not just mock cancellation."""
+        import os
+        import stat
+        import textwrap
+
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        script_path = tmp_path / "fake_cli.py"
+        script_path.write_text(
+            textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import sys, json
+            msg = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}], "model": "test"}}
+            sys.stdout.write(json.dumps(msg) + "\\n")
+            sys.stdout.flush()
+            sys.stdin.read()  # block until stdin is closed, then exit cleanly
+        """)
+        )
+        script_path.chmod(stat.S_IRWXU)
+
+        async def _test():
+            transport = SubprocessCLITransport(
+                prompt="test",
+                options=ClaudeAgentOptions(cli_path=script_path),
+            )
+            await transport.connect()
+
+            q = Query(transport=transport, is_streaming_mode=False)
+            await q.start()
+
+            async for _ in q.receive_messages():
+                break
+
+            with anyio.fail_after(5.0):
+                await q.close()
+
+        with patch.dict(os.environ, {"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": "1"}):
+            anyio.run(_test)
+
+    def test_loop_end_cleans_up_without_explicit_close(self):
+        """Abandoning a query without calling close() should not cause the event
+        loop to hang during cleanup — the service task must respond to cancellation."""
+        import threading
+
+        async def _test():
+            q = self._blocking_query()
+            await q.start()
+
+            async for _msg in q.receive_messages():
+                break  # never call q.close()
+
+        thread = threading.Thread(target=lambda: anyio.run(_test), daemon=True)
+        thread.start()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "event loop hung cleaning up abandoned query"
+
+
 class TestNoTimeoutForHooksAndMcpServers:
     """Regression test for #730: stdin must not be closed by a timeout when
     hooks or SDK MCP servers are active."""
@@ -589,7 +676,6 @@ class TestQueryCrossTaskCleanup:
             await q.start()
             await q.close()
 
-            assert q._read_task is None
             mock_transport.close.assert_called_once()
 
         anyio.run(_test)
@@ -623,13 +709,12 @@ class TestQueryTrioBackend:
             await q.start()
             await q.close()
 
-            assert q._read_task is None
             mock_transport.close.assert_called_once()
 
         anyio.run(_test, backend="trio")
 
-    def test_spawn_task_and_cancel_under_trio(self):
-        """spawn_task() under trio tracks and cancels child tasks on close()."""
+    def test_task_group_cancels_tasks_on_close_under_trio(self):
+        """Tasks added to the service group are cancelled when close() is called."""
 
         async def _test():
             mock_transport = _make_mock_transport(messages=[])
@@ -637,17 +722,22 @@ class TestQueryTrioBackend:
 
             await q.start()
 
-            async def _slow():
-                await anyio.sleep(10)
+            task_cancelled = anyio.Event()
 
-            handle = q.spawn_task(_slow())
-            assert handle in q._child_tasks
+            async def _slow() -> None:
+                try:
+                    await anyio.sleep(10)
+                except anyio.get_cancelled_exc_class():
+                    task_cancelled.set()
+                    raise
+
+            assert q._stg is not None and q._stg.tg is not None
+            q._stg.tg.start_soon(_slow)
 
             await q.close()
-            # close() cancels child tasks; give the system task a tick to
-            # fire its done callback that removes it from the set.
+            # Give the host task a tick to finish after cancellation.
             await anyio.sleep(0)
-            assert len(q._child_tasks) == 0
+            assert task_cancelled.is_set()
 
         anyio.run(_test, backend="trio")
 

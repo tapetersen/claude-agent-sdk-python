@@ -266,7 +266,8 @@ class ClaudeSDKClient:
             }
             await self._transport.write(json.dumps(message) + "\n")
         elif prompt is not None and isinstance(prompt, AsyncIterable):
-            self._query.spawn_task(self._query.stream_input(prompt))
+            assert self._query._stg is not None and self._query._stg.tg is not None
+            self._query._stg.tg.start_soon(self._query.stream_input, prompt)
 
     async def receive_messages(self) -> AsyncIterator[Message]:
         """Receive all messages from Claude."""
